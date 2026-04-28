@@ -1,437 +1,367 @@
-# AI-78: MCP Platform Health Check
+# Forcepoint Enterprise AI Agent
 
-Verifies that all four MCP platform infrastructure components — **LiteLLM**, **Redis**, **Vault**, and **LangSmith** — are operational before Sprint 1 begins. All four must pass the acceptance criteria defined in ADD Section 4.
+A production-grade AI assistant that gives every Forcepoint employee natural-language access to Microsoft 365, Jira, and Salesforce — all through a single FastAPI endpoint.
+
+Built on Claude (via LiteLLM), with per-user budget enforcement, end-to-end LangSmith tracing, and an MCP connector architecture that keeps each system's native RBAC intact.
 
 ---
 
 ## Table of Contents
 
-1. [Architecture Overview](#architecture-overview)
-2. [Prerequisites](#prerequisites)
-3. [Repository Structure](#repository-structure)
-4. [Quick Start](#quick-start)
-5. [Component Reference](#component-reference)
-   - [LiteLLM](#litellm)
-   - [Redis](#redis)
-   - [Vault](#vault)
-   - [LangSmith](#langsmith)
-6. [Configuration Reference](#configuration-reference)
-7. [Running the Health Check](#running-the-health-check)
-8. [Acceptance Criteria](#acceptance-criteria)
-9. [Troubleshooting](#troubleshooting)
-10. [Completion Checklist](#completion-checklist)
+1. [Architecture](#architecture)
+2. [Project Structure](#project-structure)
+3. [Prerequisites](#prerequisites)
+4. [Configuration](#configuration)
+5. [Quick Start](#quick-start)
+6. [Auth Flows](#auth-flows)
+7. [API Reference](#api-reference)
+8. [Skills System](#skills-system)
+9. [Adding a New Connector](#adding-a-new-connector)
+10. [Infrastructure](#infrastructure)
 
 ---
 
-## Architecture Overview
+## Architecture
 
 ```text
-┌──────────────────────────────────────────────────────────────────┐
-│  Client / health_check.py                                        │
-│       │                                                          │
-│       ▼  :4000                                                   │
-│  ┌─────────────┐    cache hits    ┌───────────────┐             │
-│  │   LiteLLM   │ ◄─────────────► │  Redis :6379  │             │
-│  │   (proxy)   │   TTL = 3600s   │  (cache layer)│             │
-│  └──────┬──────┘                 └───────────────┘             │
-│         │ route                                                   │
-│         ▼                         ┌───────────────┐             │
-│  Anthropic API                    │  Vault :8200  │             │
-│  (claude-sonnet-4-5)              │  (secrets)    │             │
-│         │                         └───────────────┘             │
-│         │ callbacks                                               │
-│         ▼                                                         │
-│  LangSmith (cloud)                                               │
-│  (traces / observability)                                        │
-└──────────────────────────────────────────────────────────────────┘
+Employee (browser / Teams tab)
+        │
+        │  POST /chat  Bearer: <Entra SSO token>
+        ▼
+┌───────────────────────────────────────────────────────────┐
+│  FastAPI  (agent/main.py)                                 │
+│                                                           │
+│  verify_entra_token()  →  validates JWT signature         │
+│  get_or_create_litellm_key()  →  per-user budget key      │
+│  exchange_token_for_graph()  →  OBO → Graph API token     │
+│                                                           │
+│  run_agent()                                              │
+│    └─ Claude via LiteLLM  (per-user virtual key)          │
+│         ├─ m365_*  ──►  M365 MCP Server  ──►  Graph API  │
+│         ├─ jira_*  ──►  Jira MCP Server  ──►  Atlassian  │
+│         └─ sf_*    ──►  SF MCP Server    ──►  CData/SF   │
+│                                                           │
+│  LangSmith traces every turn (user_id = Entra OID)        │
+└───────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌───────────────────────────────────────────────────────────┐
+│  Infrastructure (docker-compose)                          │
+│  mcp_redis    :6379  — skill cache + OAuth token store    │
+│  mcp_litellm  :4000  — Claude proxy, budget enforcement   │
+│  mcp_vault    :8200  — secret storage (dev mode)          │
+└───────────────────────────────────────────────────────────┘
 ```
 
-**Data flows:**
+**Auth context injected per connector — automatically, no user action:**
 
-- Completion requests hit LiteLLM on `:4000`, which routes them to Anthropic.
-- LiteLLM caches responses in Redis with a 3600-second TTL.
-- Every invocation emits a trace to LangSmith via the success/failure callbacks.
-- Connector credentials (JWT/OAuth2) are stored in Vault and read at runtime.
+| Connector | Mechanism | RBAC enforced by |
+|---|---|---|
+| `m365_*` | Entra OBO → Graph API token | Microsoft Graph (user's own data only) |
+| `jira_*` | Atlassian OAuth 3LO token (Redis) | Jira project permissions |
+| `sf_*` | Department-mapped CData connection | Salesforce profile / permission sets |
+
+---
+
+## Project Structure
+
+```text
+forcepoint-ai/
+├── agent/
+│   ├── main.py          # FastAPI app, agent loop, MCP subprocess routing
+│   └── tools.py         # Tool definitions passed to Claude (all 3 connectors)
+│
+├── auth/
+│   ├── entra.py         # Entra ID JWT validation (JWKS, RS256)
+│   ├── obo_flow.py      # On-Behalf-Of exchange: Entra token → Graph API token
+│   ├── jira_auth.py     # Atlassian OAuth 3LO — authorise, callback, auto-refresh
+│   ├── salesforce_auth.py  # Department → CData connection mapping
+│   └── litellm_provisioner.py  # Per-user virtual key lifecycle (provision, revoke, spend)
+│
+├── mcp_servers/
+│   ├── base_server.py   # Shared MCP base class (error wrapping, response helpers)
+│   ├── m365_server.py   # Email, Calendar, Teams, OneDrive/SharePoint
+│   ├── jira_server.py   # Issues, sprints, epics, comments, transitions
+│   └── salesforce_server.py  # Pipeline, accounts, renewals, ACV via CData SQL
+│
+├── skills/
+│   └── loader.py        # Fetches skill docs from GitHub at startup, caches in Redis
+│
+├── config.py            # All env var bindings in one place
+├── docker-compose.yml   # Redis, Vault, LiteLLM containers
+├── litellm_config.yaml  # Model routing, Redis cache, LangSmith callbacks
+├── health_check.py      # Infrastructure readiness check (Redis, Vault, LiteLLM, LangSmith)
+├── activate.sh          # Activates venv + loads .env in one step
+├── .env.example         # Credential template — copy to .env
+└── .gitignore
+```
 
 ---
 
 ## Prerequisites
 
-### Runtime
+| Dependency | Version | Notes |
+|---|---|---|
+| Python | 3.12+ | |
+| Docker Engine | 24.x+ | For Redis, Vault, LiteLLM |
+| Docker Compose | v2.x | Ships with Docker Desktop |
 
-| Dependency     | Minimum version | Notes                                                   |
-| -------------- | --------------- | ------------------------------------------------------- |
-| Docker Engine  | 24.x            | Required for all three containers                       |
-| Docker Compose | v2.x            | Ships with Docker Desktop; `docker compose` (no hyphen) |
-| Python         | 3.12            | Already on the host                                     |
-
-### API Keys (external services)
-
-| Service            | Environment variable | Where to obtain                                                   |
-| ------------------ | -------------------- | ----------------------------------------------------------------- |
-| Anthropic          | `ANTHROPIC_API_KEY`  | [console.anthropic.com](https://console.anthropic.com) → API Keys |
-| LangSmith          | `LANGCHAIN_API_KEY`  | smith.langchain.com → Settings → API Keys                         |
-| LiteLLM master key | `LITELLM_MASTER_KEY` | Any string you generate (e.g. `sk-litellm-local-dev`)             |
-
-Vault and Redis run in development mode and require no external accounts.
-
----
-
-## Repository Structure
-
-```text
-AI-78/
-├── .env.example          # Credential template — copy to .env and fill in values
-├── .env                  # Your local credentials (git-ignored, never commit)
-├── activate.sh           # Activates venv + loads .env in one step
-├── docker-compose.yml    # Defines mcp_redis, mcp_vault, mcp_litellm containers
-├── litellm_config.yaml   # LiteLLM model routing, Redis cache config, LangSmith callbacks
-├── health_check.py       # Automated health check script — tests all four components
-└── README.md             # This file
+**Python packages** (install into your venv):
+```bash
+pip install anthropic fastapi uvicorn httpx msal redis pyjwt \
+            langsmith mcp python-dotenv pydantic
 ```
 
-> **Note:** The Python virtual environment lives at `~/.venvs/mcp-platform` (shared, outside this repo). It is not committed.
-
 ---
 
-## Quick Start
+## Configuration
 
-### 1. Clone credentials template
+Copy the template and fill in required values:
 
 ```bash
 cp .env.example .env
 ```
 
-Open `.env` and fill in the three required values:
+| Variable | Required | Description |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | Yes | Anthropic API key |
+| `LITELLM_MASTER_KEY` | Yes | Bearer key for the LiteLLM proxy |
+| `LITELLM_BASE_URL` | No | Default: `http://localhost:4000` |
+| `CLAUDE_MODEL` | No | Default: `claude-sonnet` |
+| `REDIS_URL` | No | Default: `redis://localhost:6379` |
+| `LANGCHAIN_API_KEY` | Yes | LangSmith API key |
+| `LANGCHAIN_PROJECT` | No | Default: `forcepoint-enterprise-ai` |
+| **Azure / M365** | | |
+| `AZURE_TENANT_ID` | Yes | Entra tenant ID |
+| `AZURE_CLIENT_ID` | Yes | App registration client ID |
+| `AZURE_CLIENT_SECRET` | Yes | App registration secret |
+| **Atlassian / Jira** | | |
+| `ATLASSIAN_OAUTH_CLIENT_ID` | Yes | OAuth 2.0 (3LO) app — developer.atlassian.com |
+| `ATLASSIAN_OAUTH_CLIENT_SECRET` | Yes | Same app |
+| `ATLASSIAN_OAUTH_REDIRECT_URI` | No | Default: `https://your-agent.fpdev.io/auth/jira/callback` |
+| `JIRA_DEFAULT_PROJECT` | No | Default: `AI` |
+| **Salesforce via CData** | | |
+| `CDATA_BASE_URL` | Yes | CData Connect AI base URL |
+| `CDATA_API_KEY` | Yes | CData API key |
+| `CDATA_CONNECTION_SALES` | No | Default: `Salesforce_Sales` |
+| `CDATA_CONNECTION_OPS` | No | Default: `Salesforce_Ops` |
+| `CDATA_CONNECTION_DEFAULT` | No | Default: `Salesforce` |
+| **Entra Groups** | | |
+| `ENTRA_GROUP_SALES` | No | Azure AD group Object ID → sales tier |
+| `ENTRA_GROUP_ENG` | No | Azure AD group Object ID → engineering tier |
+| `ENTRA_GROUP_FINANCE` | No | Azure AD group Object ID → finance tier |
+| **GitHub Skills** | | |
+| `SKILLS_REPO_BASE_URL` | No | Raw base URL to the `claude-skills/docs` folder |
+| `SKILLS_GITHUB_TOKEN` | No | PAT for internal GitHub (if repo is private) |
+| `SKILLS_CACHE_TTL` | No | Default: `3600` seconds |
 
-```dotenv
-ANTHROPIC_API_KEY=sk-ant-<your key>
-LITELLM_MASTER_KEY=sk-litellm-local-dev
-LANGCHAIN_API_KEY=ls__<your key>
+---
+
+## Quick Start
+
+### 1. Start infrastructure
+
+```bash
+docker compose up -d
+docker compose ps   # all three should show "healthy" within ~60s
 ```
 
-Everything else (Redis host, Vault token, tracing flags) is pre-configured for local dev.
-
-### 2. Activate the environment
+### 2. Activate environment
 
 ```bash
 source activate.sh
 ```
 
-This activates the Python virtual environment and loads your `.env` into the shell. Run this once per terminal session.
+Activates the Python venv at `~/.venvs/mcp-platform` and loads `.env` into the shell.
 
-### 3. Pull and start all containers
-
-```bash
-docker compose up -d
-```
-
-Expected startup order: `mcp_redis` → `mcp_vault` → `mcp_litellm` (LiteLLM waits for Redis to be healthy before starting).
-
-Check that all three are running:
-
-```bash
-docker compose ps
-```
-
-All three should show `healthy` within ~60 seconds.
-
-### 4. Run the health check
+### 3. Verify infrastructure
 
 ```bash
 python3 health_check.py
 ```
 
-A passing run prints `✔ PASS` for all four components and exits with code `0`.
+All four components (LiteLLM, Redis, Vault, LangSmith) must show `✔ PASS` before running the agent.
 
----
-
-## Component Reference
-
-### LiteLLM
-
-| Property          | Value                                 |
-| ----------------- | ------------------------------------- |
-| Container         | `mcp_litellm`                         |
-| Port              | `4000`                                |
-| Image             | `ghcr.io/berriai/litellm:main-latest` |
-| Config file       | `litellm_config.yaml`                 |
-| Backend model     | `anthropic/claude-sonnet-4-5`         |
-| Proxy model alias | `claude-sonnet-4-20250514`            |
-
-**Manual test:**
+### 4. Run the agent
 
 ```bash
-curl http://localhost:4000/chat/completions \
+uvicorn agent.main:http_app --reload --port 8000
+```
+
+### 5. Send a request
+
+```bash
+curl http://localhost:8000/chat \
+  -H "Authorization: Bearer <entra-token>" \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
-  -d '{
-    "model": "claude-sonnet-4-20250514",
-    "messages": [{"role": "user", "content": "ping"}],
-    "max_tokens": 10
-  }'
+  -d '{"message": "What are my Jira tickets in progress this sprint?"}'
 ```
 
-**Pass:** HTTP 200, response contains a `choices` array with a non-empty message content.
-
 ---
 
-### Redis
+## Auth Flows
 
-| Property    | Value                              |
-| ----------- | ---------------------------------- |
-| Container   | `mcp_redis`                        |
-| Port        | `6379`                             |
-| Image       | `redis:7-alpine`                   |
-| Cache TTL   | `3600` seconds (per ADD Section 4) |
-| Persistence | Disabled (in-memory only for dev)  |
+### Microsoft 365 — Entra OBO (automatic)
 
-**Manual test:**
+No employee action needed. On every `/chat` request:
+1. The agent validates the Entra Bearer token
+2. Calls `exchange_token_for_graph()` (MSAL On-Behalf-Of)
+3. Injects the resulting Graph API token into all `m365_*` tool calls
+4. Microsoft enforces the user's own permissions — they see only their own email, calendar, and files
 
-```bash
-# Using redis-py (activated venv)
-python3 - <<'EOF'
-import redis, os
-r = redis.Redis(host="localhost", port=6379)
-r.set("mcp_health_check", "ok", ex=3600)
-print("GET:", r.get("mcp_health_check"))
-print("TTL:", r.ttl("mcp_health_check"))
-r.delete("mcp_health_check")
-EOF
+### Jira — Atlassian OAuth 3LO (one-time per employee)
 
-# Or using docker exec (no redis-cli install needed)
-docker exec mcp_redis redis-cli SET mcp_health_check ok EX 3600
-docker exec mcp_redis redis-cli GET mcp_health_check
-docker exec mcp_redis redis-cli TTL mcp_health_check
+Employees authorise once. Token stored in Redis, auto-refreshed.
+
+```text
+1. Employee visits GET /auth/jira/start
+   → Redirected to Atlassian consent screen
+
+2. Employee approves → Atlassian redirects to GET /auth/jira/callback
+   → Tokens stored in Redis under key jira_token:{user_oid}
+
+3. All subsequent jira_* tool calls use the stored token automatically
+   → Actions appear under the employee's name in Jira audit logs
 ```
 
-**Pass:** `GET` returns `ok`. `TTL` returns a value between `3595` and `3600`.
+### Salesforce — Department-mapped CData connections (automatic)
+
+No employee action. The user's Entra group membership (from `ENTRA_GROUP_*` config) maps to a CData connection backed by the appropriate Salesforce profile:
+
+| Department | CData connection | Salesforce profile |
+|---|---|---|
+| `sales` | `Salesforce_Sales` | Full pipeline access |
+| `engineering` / `finance` | `Salesforce_Ops` | Read-only operational view |
+| `default` | `Salesforce` | Minimal read access |
 
 ---
 
-### Vault
+## API Reference
 
-| Property       | Value                                        |
-| -------------- | -------------------------------------------- |
-| Container      | `mcp_vault`                                  |
-| Port           | `8200`                                       |
-| Image          | `hashicorp/vault:1.17`                       |
-| Mode           | Dev (auto-unsealed, no snapshot persistence) |
-| Root token     | `root` (set via `VAULT_DEV_ROOT_TOKEN_ID`)   |
-| Secrets engine | KV v2 at `secret/`                           |
+### `POST /chat`
 
-**Manual test:**
+Main agent endpoint.
 
-```bash
-export VAULT_ADDR=http://localhost:8200
-export VAULT_TOKEN=root
+**Headers:**
 
-vault status
-# Expect: Sealed = false, Initialized = true
-
-vault kv put secret/forcepoint/salesforce \
-  client_id="test-client" \
-  client_secret="test-secret"
-
-vault kv get secret/forcepoint/salesforce
+```http
+Authorization: Bearer <Entra SSO token>
+Content-Type: application/json
 ```
 
-**Pass:** `vault status` shows `Sealed: false`. The `kv get` command returns field names without error.
-
-> **Important:** Dev mode does not persist secrets across container restarts. For production, replace with a properly initialized and unsealed Vault instance backed by a storage backend.
-
----
-
-### LangSmith
-
-| Property        | Value                                           |
-| --------------- | ----------------------------------------------- |
-| Service         | Cloud (smith.langchain.com)                     |
-| Project         | `forcepoint-eai`                                |
-| Tracing trigger | LiteLLM `success_callback` + `failure_callback` |
-| Env var         | `LANGCHAIN_TRACING_V2=true`                     |
-
-**Manual test:**
-
-```bash
-python3 - <<'EOF'
-import os, litellm
-
-litellm.success_callback = ["langsmith"]
-litellm.failure_callback = ["langsmith"]
-
-resp = litellm.completion(
-    model="openai/claude-sonnet-4-20250514",
-    api_base="http://localhost:4000",
-    api_key=os.environ["LITELLM_MASTER_KEY"],
-    messages=[{"role": "user", "content": "health check trace test"}],
-    max_tokens=10,
-)
-print(resp.choices[0].message.content)
-EOF
+**Body:**
+```json
+{ "message": "Show me the EMEA renewal pipeline" }
 ```
 
-Then open [smith.langchain.com](https://smith.langchain.com) → project `forcepoint-eai` and confirm the trace appears within 30 seconds.
-
-**Pass:** Trace visible in the LangSmith dashboard showing model, input, output, latency, and token count with no errors.
-
----
-
-## Configuration Reference
-
-All configuration is driven by `.env`. The `litellm_config.yaml` and `docker-compose.yml` reference these variables via `os.environ/` and `${}` substitution respectively.
-
-| Variable               | Required | Default                 | Description                                      |
-| ---------------------- | -------- | ----------------------- | ------------------------------------------------ |
-| `ANTHROPIC_API_KEY`    | Yes      | —                       | Anthropic API key for Claude routing             |
-| `LITELLM_MASTER_KEY`   | Yes      | —                       | Bearer token clients send to the LiteLLM proxy   |
-| `LANGCHAIN_API_KEY`    | Yes      | —                       | LangSmith API key for trace ingestion            |
-| `LANGCHAIN_TRACING_V2` | Yes      | `true`                  | Enables LangChain/LiteLLM → LangSmith tracing    |
-| `LANGCHAIN_PROJECT`    | Yes      | `forcepoint-eai`        | LangSmith project name                           |
-| `REDIS_HOST`           | No       | `redis`                 | Redis hostname (use `localhost` outside Docker)  |
-| `REDIS_PORT`           | No       | `6379`                  | Redis port                                       |
-| `REDIS_PASSWORD`       | No       | —                       | Redis auth password (uncomment if needed)        |
-| `VAULT_ADDR`           | No       | `http://localhost:8200` | Vault API address                                |
-| `VAULT_TOKEN`          | No       | `root`                  | Vault authentication token                       |
-| `VAULT_DEV_ROOT_TOKEN` | No       | `root`                  | Root token injected into the Vault dev container |
-
----
-
-## Running the Health Check
-
-```bash
-# Full automated check — all four components
-python3 health_check.py
-
-# Expected output on full pass:
-# ────────────────────────────────────────────────────────────
-#   Component 1 — LiteLLM
-# ────────────────────────────────────────────────────────────
-#   ✔ PASS  /health reachable
-#   ✔ PASS  Completion routes successfully
-#
-# ────────────────────────────────────────────────────────────
-#   Component 2 — Redis
-# ────────────────────────────────────────────────────────────
-#   ✔ PASS  Redis reachable (PING)
-#   ✔ PASS  SET/GET round-trip
-#   ✔ PASS  TTL ≈ 3600s
-#
-# ────────────────────────────────────────────────────────────
-#   Component 3 — Vault
-# ────────────────────────────────────────────────────────────
-#   ✔ PASS  Vault reachable
-#   ✔ PASS  Vault initialized
-#   ✔ PASS  Vault unsealed
-#   ✔ PASS  Write test secret (kv-v2)
-#   ✔ PASS  Read secret fields back
-#
-# ────────────────────────────────────────────────────────────
-#   Component 4 — LangSmith
-# ────────────────────────────────────────────────────────────
-#   ✔ PASS  LANGCHAIN_API_KEY set
-#   ✔ PASS  LANGCHAIN_TRACING_V2=true
-#   ✔ PASS  LANGCHAIN_PROJECT set
-#   ✔ PASS  LiteLLM call succeeded
+**Response:**
+```json
+{ "response": "Here are the open EMEA renewals..." }
 ```
 
-The script exits `0` on full pass and `1` if any component fails.
+---
+
+### `GET /health`
+
+Returns which skills are loaded.
+
+```json
+{
+  "status": "ok",
+  "skills": { "m365": true, "jira": true, "salesforce": true }
+}
+```
 
 ---
 
-## Acceptance Criteria
+### `POST /skills/invalidate/{skill_name}`
 
-Per AI-78 / ADD Section 4 — all four must be green before Sprint 1 begins:
-
-| #   | Criterion                                                          | Verified by                                            |
-| --- | ------------------------------------------------------------------ | ------------------------------------------------------ |
-| 1   | LiteLLM routes a test completion with valid response and no errors | `health_check.py` Component 1                          |
-| 2   | Redis responds to SET/GET with TTL confirmed at 3600s              | `health_check.py` Component 2                          |
-| 3   | Vault is unsealed and a secret can be successfully read            | `health_check.py` Component 3                          |
-| 4   | LangSmith trace visible for a test invocation                      | `health_check.py` Component 4 + manual dashboard check |
-| 5   | Screenshot evidence archived and attached to AI-66                 | Manual — capture terminal output + LangSmith dashboard |
-
----
-
-## Troubleshooting
-
-### LiteLLM — `Connection refused` on `:4000`
+Webhook called by the skills validation pipeline after a new skill version is pushed to GitHub. Forces the next request to re-fetch the skill from the repo — no agent restart needed.
 
 ```bash
-docker compose ps          # check mcp_litellm status
+curl -X POST http://localhost:8000/skills/invalidate/jira
+```
+
+---
+
+### `GET /auth/jira/start`
+
+Requires Entra Bearer token. Returns the Atlassian OAuth authorisation URL to redirect the employee to.
+
+---
+
+### `GET /auth/jira/callback`
+
+Atlassian redirects here after the employee approves. Exchanges the auth code for tokens and stores them in Redis.
+
+---
+
+## Skills System
+
+Skills are Markdown documents stored in the internal GitHub repo at:
+
+```text
+github.cicd.cloud.fpdev.io/BTS/claude-skills/main/docs/
+├── m365-skill.md
+├── jira-skill.md
+└── salesforce-skill.md
+```
+
+At startup, the agent fetches all three and injects them into the system prompt. They cache in Redis for `SKILLS_CACHE_TTL` seconds (default 1 hour).
+
+Skills encode query patterns, field sets, and routing rules — they teach Claude how to use each connector efficiently and avoid redundant discovery calls.
+
+To push an updated skill without restarting the agent, call `POST /skills/invalidate/{skill_name}` after merging the new version.
+
+---
+
+## Adding a New Connector
+
+1. **Create the MCP server** — `mcp_servers/your_server.py`, extending `BaseMCPServer`
+2. **Add tool definitions** — append a `YOUR_TOOLS` list to `agent/tools.py` and add it to `ALL_TOOLS`
+3. **Register the subprocess** — add an entry to `_start_mcp_servers()` in `agent/main.py`
+4. **Inject auth context** — add an `elif block.name.startswith("your_"):` branch in the tool injection loop in `run_agent()`
+5. **Add a skill doc** — create `your-skill.md` in the GitHub skills repo and add it to `Config.SKILLS`
+6. **Add config vars** — any new credentials go in `config.py` and `.env.example`
+
+---
+
+## Infrastructure
+
+### Containers
+
+| Container | Port | Purpose |
+|---|---|---|
+| `mcp_redis` | `6379` | Skill cache + Jira/SF OAuth token store |
+| `mcp_litellm` | `4000` | Claude proxy — per-user virtual keys, spend limits, response caching |
+| `mcp_vault` | `8200` | Secret storage (dev mode — replace with production Vault for prod) |
+
+### LiteLLM virtual keys
+
+Each employee gets a virtual key scoped to their department's monthly budget and allowed models. Provisioned automatically on first login via `auth/litellm_provisioner.py`. If a user exceeds their budget, LiteLLM returns 429 — the agent surfaces a friendly message.
+
+| Department | Monthly budget | Models |
+|---|---|---|
+| Engineering | $30 | claude-sonnet, claude-haiku |
+| Sales | $20 | claude-sonnet, claude-haiku |
+| Finance | $15 | claude-haiku |
+| Default | $10 | claude-haiku |
+
+### Useful commands
+
+```bash
+# Check all containers
+docker compose ps
+
+# View LiteLLM logs
 docker compose logs litellm --tail 50
+
+# Flush Redis (clears skill cache and OAuth tokens)
+docker exec mcp_redis redis-cli FLUSHALL
+
+# Check a user's Jira token is stored
+docker exec mcp_redis redis-cli GET "jira_token:<user_oid>"
+
+# Run infrastructure health check
+python3 health_check.py
 ```
-
-LiteLLM starts only after Redis is healthy. If Redis is still starting, wait 30 seconds and retry.
-
-### LiteLLM — `401 Unauthorized`
-
-Your `LITELLM_MASTER_KEY` in `.env` must match the `Authorization: Bearer` value in the request. Confirm both are identical.
-
-### LiteLLM — `Model not found`
-
-The request must use `claude-sonnet-4-20250514` exactly — this is the `model_name` alias defined in `litellm_config.yaml`. Any other string will return 404.
-
-### Redis — `TTL` returns `-1`
-
-The key was written without an expiry. This means LiteLLM's `cache_params.ttl` is not being applied. Check that `litellm_config.yaml` is mounted correctly and the `cache: true` block is present.
-
-```bash
-docker exec mcp_litellm cat /app/config.yaml
-```
-
-### Redis — `TTL` returns `-2`
-
-The key does not exist. You may be connected to the wrong Redis instance. Confirm `REDIS_HOST=redis` inside the LiteLLM container and `localhost` when running commands directly on the host.
-
-### Vault — `Sealed: true`
-
-The dev-mode container auto-unseals on start. If you see `Sealed: true`, the container likely restarted and lost its in-memory state.
-
-```bash
-docker compose restart vault
-# wait ~5 seconds, then re-run
-vault status
-```
-
-If running against a production Vault instance (not dev mode), you must unseal with the unseal keys — this is a hard blocker and must be escalated before Sprint 1.
-
-### Vault — `403 Permission Denied`
-
-Your `VAULT_TOKEN` does not have a policy covering the secret path. Check policies:
-
-```bash
-vault token lookup
-vault policy list
-vault policy read default
-```
-
-### LangSmith — trace does not appear
-
-1. Confirm `LANGCHAIN_TRACING_V2=true` (the string `"true"`, not `True` or `1`).
-2. Confirm `LANGCHAIN_API_KEY` is valid — regenerate at smith.langchain.com → Settings → API Keys if in doubt.
-3. Confirm the project name matches exactly: `forcepoint-eai`.
-4. Check LiteLLM logs for callback errors: `docker compose logs litellm --tail 100 | grep -i langsmith`.
-
-### Containers won't start — port already in use
-
-```bash
-# find what's holding the port
-ss -tlnp | grep -E '4000|6379|8200'
-```
-
-Stop the conflicting process or change the host-side port mapping in `docker-compose.yml`.
-
----
-
-## Completion Checklist
-
-Once `health_check.py` reports all four components as `✔ PASS`:
-
-- [ ] Capture terminal screenshot of the full `health_check.py` output
-- [ ] Capture screenshot of the LangSmith dashboard showing the trace
-- [ ] Attach both screenshots to AI-66 (Snapshot Link field)
-- [ ] Note any non-default configuration (non-standard ports, alternate auth method) in the AI-78 comments
-- [ ] Set AI-78 fields: **Unit Test Complete → Yes**, **Environment to Test → MCP platform**
-- [ ] Transition AI-78 to **Done**
-- [ ] Proceed to remaining AI-66 sub-tasks in parallel
