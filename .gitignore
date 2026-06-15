@@ -38,3 +38,6 @@ htmlcov/
 
 # macOS
 .DS_Store
+
+# Ask AI smoke-test venv
+.venv-ask/
