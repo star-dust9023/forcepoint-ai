@@ -2,7 +2,7 @@ version: "3.9"
 
 services:
   redis:
-    image: redis:7-alpine
+    image: docker.io/library/redis:7-alpine
     container_name: mcp_redis
     ports:
       - "6379:6379"
@@ -15,7 +15,7 @@ services:
     restart: unless-stopped
 
   vault:
-    image: hashicorp/vault:1.17
+    image: docker.io/hashicorp/vault:1.17
     container_name: mcp_vault
     ports:
       - "8200:8200"

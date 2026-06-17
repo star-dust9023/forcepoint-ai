@@ -11,6 +11,9 @@ portal proxy.
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+load_dotenv()
+
 
 class AskConfig:
     # ── Anthropic (direct API — no LiteLLM in this contained service) ──────

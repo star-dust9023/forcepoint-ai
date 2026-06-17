@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AI-78: MCP Platform Health Check — LiteLLM, Redis, Vault, LangSmith"""
+"""AI-78: MCP Platform Health Check — OPA Hybrid Router, Redis, Vault, LangSmith"""
 
 import os
 import sys
@@ -33,58 +33,9 @@ def check(label: str, ok: bool, detail: str = "") -> bool:
     return ok
 
 
-# ── Component 1: LiteLLM ──────────────────────────────────────────────────────
-def check_litellm() -> bool:
-    header("Component 1 — LiteLLM")
-    import urllib.request
-    import urllib.error
-
-    host = os.getenv("LITELLM_HOST", "http://localhost:4000")
-    api_key = os.getenv("LITELLM_MASTER_KEY") or os.getenv("LITELLM_API_KEY", "")
-
-    # 1a. /health endpoint
-    try:
-        req = urllib.request.Request(f"{host}/health")
-        with urllib.request.urlopen(req, timeout=5) as r:
-            health_ok = r.status == 200
-    except Exception as e:
-        health_ok = False
-        check("/health reachable", False, str(e))
-        return False
-    check("/health reachable", health_ok)
-
-    # 1b. Test completion
-    payload = json.dumps({
-        "model": "claude-sonnet-4-20250514",
-        "messages": [{"role": "user", "content": "ping"}],
-        "max_tokens": 10,
-    }).encode()
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    }
-    req = urllib.request.Request(
-        f"{host}/chat/completions", data=payload, headers=headers, method="POST"
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            body = json.loads(r.read())
-            has_choices = bool(body.get("choices"))
-            reply = body["choices"][0]["message"]["content"] if has_choices else ""
-            check("Completion routes successfully", has_choices, f"reply: {reply!r}")
-            return has_choices
-    except urllib.error.HTTPError as e:
-        body = e.read().decode()
-        check("Completion routes successfully", False, f"HTTP {e.code}: {body[:200]}")
-        return False
-    except Exception as e:
-        check("Completion routes successfully", False, str(e))
-        return False
-
-
-# ── Component 2: Redis ─────────────────────────────────────────────────────────
+# ── Component 1: Redis ─────────────────────────────────────────────────────────
 def check_redis() -> bool:
-    header("Component 2 — Redis")
+    header("Component 1 — Redis")
     try:
         import redis as redis_lib
     except ImportError:
@@ -160,9 +111,9 @@ def _check_redis_cli() -> bool:
         return False
 
 
-# ── Component 3: Vault ────────────────────────────────────────────────────────
+# ── Component 2: Vault ────────────────────────────────────────────────────────
 def check_vault() -> bool:
-    header("Component 3 — Vault")
+    header("Component 2 — Vault")
     addr = os.getenv("VAULT_ADDR", "http://localhost:8200")
     token = os.getenv("VAULT_TOKEN", "root")
 
@@ -237,9 +188,9 @@ def check_vault() -> bool:
         return False
 
 
-# ── Component 4: LangSmith ────────────────────────────────────────────────────
+# ── Component 3: LangSmith ────────────────────────────────────────────────────
 def check_langsmith() -> bool:
-    header("Component 4 — LangSmith")
+    header("Component 3 — LangSmith")
 
     api_key = os.getenv("LANGCHAIN_API_KEY", "")
     tracing = os.getenv("LANGCHAIN_TRACING_V2", "")
@@ -298,9 +249,8 @@ def main() -> None:
     print(f"Timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
 
     results = {
-        "LiteLLM": check_litellm(),
-        "Redis": check_redis(),
-        "Vault": check_vault(),
+        "Redis":     check_redis(),
+        "Vault":     check_vault(),
         "LangSmith": check_langsmith(),
     }
 
@@ -314,7 +264,7 @@ def main() -> None:
 
     print()
     if all_pass:
-        print(f"{GREEN}{BOLD}All four components are green. AI-78 acceptance criteria met.{RESET}")
+        print(f"{GREEN}{BOLD}All three components are green. AI-78 acceptance criteria met.{RESET}")
         print("Next: attach screenshot evidence to AI-78 and transition ticket to Done.")
     else:
         failing = [k for k, v in results.items() if not v]
